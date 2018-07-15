@@ -14,6 +14,7 @@
 #include "render.h"
 #include "htmltable.h"
 #include <limits.h>
+#include <ctype.h>
 
 #define RBCONST 12
 #define RBCURVE .5
@@ -78,6 +79,14 @@ static poly_desc_t cylinder_gen = {
     cylinder_size,
     cylinder_vertices,
 };
+
+static void embed_init(node_t * n);
+static void embed_free(node_t * n);
+static port embed_port(node_t * n, char *portname, char *);
+static boolean embed_inside(inside_t * inside_context, pointf p);
+static int embed_path(node_t * n, port * p, int side, boxf rv[],
+		       int *kptr);
+static void embed_gencode(GVJ_t * job, node_t * n);
 
 /* polygon descriptions.  "polygon" with 0 sides takes all user control */
 
@@ -229,6 +238,14 @@ static shape_functions cylinder_fns = {
     poly_path,
     poly_gencode
 };
+static shape_functions embed_fns = {
+    embed_init,
+    embed_free,
+    embed_port,
+    embed_inside,
+    embed_path,
+    embed_gencode
+};
 
 static shape_desc Shapes[] = {	/* first entry is default for no such shape */
     {"box", &poly_fns, &p_box},
@@ -297,6 +314,7 @@ static shape_desc Shapes[] = {	/* first entry is default for no such shape */
     {"Mrecord", &record_fns, NULL},
     {"epsf", &epsf_fns, NULL},
     {"star", &star_fns, &p_star},
+    {"embed", &embed_fns, NULL},
     {NULL, NULL, NULL}
 };
 
@@ -3794,6 +3812,173 @@ static void record_gencode(GVJ_t * job, node_t * n)
 				  obj->url, obj->tooltip, obj->target,
 				  obj->id);
 	gvrender_end_anchor(job);
+    }
+}
+
+// 'Embed' shape is a box with nested rectangles.  Nested rectangles are
+// positioned explicitly at user-provided coordinates.  Aiming edges at
+// nested rectangles is supported.
+//
+// The intended use case is to embed subgraphs into a larger graph,
+// possibly using different layout engines for subgraphs and the larger
+// graph.
+//
+// Rectangle coordinates are defined explicitly using the node's label:
+// bb1, bb2, ... (i.e. a comma-separated list of numbers, the first 4
+// define the first nested rectangle's bounding box in point units,
+// etc.)
+//
+// Ex: '3,2,11,4,18,1,21,3'
+//
+//    +-----------------------------------+
+// 4  |   +--------+                      |
+// 3  |   |   A    |      +---+           |
+// 2  |   +--------+      | B |           |
+// 1  |                   +---+           |
+// 0  +-----------------------------------+
+//    0   3        11     18  21
+//
+// To aim an edge at individual nested rectangle, use a rectangle's
+// index to designate a port, Ex: X->Y:1 (aiming at A). Compas points
+// are supported as well, Ex: X->Y:1:n (aiming at the top edge of A).
+//
+typedef struct {
+    size_t n;       // boxes.size
+    boxf boxes[1];  // in node's coordinate system, [0] is node itself
+} embed_t;
+
+static void embed_init(node_t * node)
+{
+    const char *label;
+    size_t n = 8; // 4+4: 4 slots for boxes[0], +4 reseved
+    embed_t *info;
+    pointf extents, origin;
+
+    extents.x = POINTS(ND_width(node));
+    extents.y = POINTS(ND_height(node));
+    origin.x = extents.x * .5;
+    origin.y = extents.y * .5;
+
+    label = ND_label(node)->text;
+    for (const char *p = label; *p; ++p) {
+        // Count separators to learn how many rectangles are there.
+        // Gives us one less than the real number of slots, but 4
+        // reserved slots will compensate for that.
+        // (We never underestimate but we could overestimate a little.)
+        n += (*p == ',');
+    }
+    n /= 4;
+
+    info = malloc(offsetof(embed_t, boxes) + n*sizeof(info->boxes[0]));
+    info->n = n;
+
+    info->boxes[0].LL.x = -extents.x * .5;
+    info->boxes[0].LL.y = -extents.y * .5;
+    info->boxes[0].UR.x = extents.x * .5;
+    info->boxes[0].UR.y = extents.y * .5;
+
+    for (size_t i = 1; ; ++i) {
+        int consumed;
+        boxf temp;
+        if (4 != sscanf(label, ",%lf,%lf,%lf,%lf%n" + (i==1),
+                        &temp.LL.x, &temp.LL.y,
+                        &temp.UR.x, &temp.UR.y,
+                        &consumed)) {
+
+            while (isspace(*label)) {
+                label++;
+            }
+            if (*label) {
+                agerr(AGERR, "bad label format %s\n", ND_label(node)->text);
+            }
+            info->n = n = i;
+            break;
+        }
+        label += consumed;
+
+        // Ensure boxes never have negative extents.
+        info->boxes[i].LL.x = MIN(temp.LL.x, temp.UR.x) - origin.x;
+        info->boxes[i].UR.x = MAX(temp.LL.x, temp.UR.x) - origin.x;
+        info->boxes[i].LL.y = MIN(temp.LL.y, temp.UR.y) - origin.y;
+        info->boxes[i].UR.y = MAX(temp.LL.y, temp.UR.y) - origin.y;
+    }
+
+    ND_shape_info(node) = info;
+}
+
+static void embed_free(node_t * n)
+{
+    free(ND_shape_info(n));
+}
+
+static port embed_port(node_t * n, char *portname, char *compass)
+{
+    embed_t *info = ND_shape_info(n);
+    size_t i;
+    port rv;
+
+    if (portname[0] == '\0') {
+        return Center;
+    }
+
+    if (compass == NULL) {
+        compass = "_";
+    }
+
+    if (sscanf(portname, "%zu", &i) == 1 && i >= 1 && i < info->n) {
+	if (compassPort(n, &info->boxes[i], &rv, compass, 0, NULL)) {
+	    agerr(AGWARN,
+		  "node %s, port %s, unrecognized compass point '%s' - ignored\n",
+		  agnameof(n), portname, compass);
+	}
+    } else if (compassPort(n, &info->boxes[0], &rv, portname, BOTTOM | RIGHT | TOP | LEFT, NULL)) {
+	unrecognized(n, portname);
+    }
+
+    return rv;
+}
+
+// Edge router calls this function to clip an edge to node shape.
+static boolean embed_inside(inside_t * inside_context, pointf p)
+{
+    node_t *n = inside_context->s.n;
+    embed_t *info = ND_shape_info(n);
+
+    // convert point to node coordinate system
+    p = ccwrotatepf(p, 90 * GD_rankdir(agraphof(n)));
+
+    // use either the node's bounding box or the port rectangle for
+    // clipping
+    return INSIDE(p, inside_context->s.bp ? *inside_context->s.bp : info->boxes[0]);
+}
+
+static int embed_path(node_t * n, port * p, int side, boxf rv[],
+		       int *kptr)
+{
+    embed_t *info = ND_shape_info(n);
+    // convert to global coordinate system
+    rv[0].LL.x = info->boxes[0].LL.x + ND_coord(n).x;
+    rv[0].LL.y = info->boxes[0].LL.y + ND_coord(n).y;
+    rv[0].UR.x = info->boxes[0].UR.x + ND_coord(n).x;
+    rv[0].UR.y = info->boxes[0].UR.y + ND_coord(n).y;
+    *kptr = 1;
+    return side;
+}
+
+static void embed_gencode(GVJ_t * job, node_t * n)
+{
+    pointf origin = ND_coord(n);
+    embed_t *info = ND_shape_info(n);
+    penColor(job, n);
+
+    for (size_t i = 0; i< info->n; i++) {
+        boxf b = info->boxes[i];
+        // convert to global coordinate system
+        b.LL.x += origin.x;
+        b.LL.y += origin.y;
+        b.UR.x += origin.x;
+        b.UR.y += origin.y;
+        gvrender_box(job, b, FALSE);
     }
 }
 
