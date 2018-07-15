@@ -63,6 +63,7 @@ if (CMAKE_CL_64)
 else()
     set(WINDOWS_DEPENDENCY_DIR "${WINDOWS_DEPENDENCY_DIR}/x86")
 endif()
+set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/${LIBRARY_INSTALL_DIR}")
 
 set(GRAPHVIZ_PLUGIN_VERSION 6)
 # Name of the config file used by Graphviz
